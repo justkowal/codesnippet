@@ -1,0 +1,385 @@
+\NeedsTeXFormat{LaTeX2e}
+\ProvidesPackage{codesnippet}[2026/10/10 v1.2 Dynamic Code Snippet Extractor using minted]
+
+% --- Required Dependencies ---
+\RequirePackage{kvoptions}     % Key-value package options
+\RequirePackage{pgfkeys}       % Key-value parser for setup & per-snippet options
+\RequirePackage{xcolor}        % Flexible color management
+\RequirePackage{minted}        % Syntax highlighting via Pygments
+\RequirePackage{shellesc}      % Portable \ShellEscape engine
+
+% --- Default Color Palette ---
+\definecolor{csniprule}{gray}{0.75}
+\definecolor{csniptitle}{gray}{0.25}
+\definecolor{csnipnum}{gray}{0.55}
+\definecolor{csniploc}{gray}{0.45}
+
+% Dynamic muted line numbering
+\renewcommand{\theFancyVerbLine}{\color{csnipnum}\scriptsize\arabic{FancyVerbLine}}
+
+% --- State Variables & Booleans ---
+\newif\ifcsnip@showtitle
+\csnip@showtitletrue
+\newif\ifcsnip@haseq
+\newif\ifcsnip@isabs
+
+\newcommand{\csnip@root}{}
+\newcommand{\csnip@default@lang}{cpp}
+\newcommand{\csnip@python}{python3}
+\newcommand{\csnip@script}{extract.py}
+\newcommand{\csnip@titleprefix}{}
+\newcommand{\csnip@titlestyle}{\footnotesize\ttfamily\bfseries}
+\newcommand{\csnip@titlesep}{0.2em}
+\newcommand{\csnip@refmode}{semantic}
+\newcommand{\csnip@refformat}{inline}
+\newcommand{\csnip@locstyle}{\footnotesize\ttfamily}
+\newcommand{\csnip@lineprefix}{:}
+\newcommand{\csnip@locprefix}{}
+
+% --- Package Load-Time Options ---
+\SetupKeyvalOptions{
+    family=csnipopt,
+    prefix=csnipopt@
+}
+\DeclareStringOption[]{root}
+\DeclareStringOption[python3]{python}
+\DeclareStringOption[extract.py]{script}
+\DeclareStringOption[colorful]{theme}
+\DeclareStringOption[cpp]{lang}
+\DeclareStringOption[semantic]{ref}
+\DeclareStringOption[inline]{refformat}
+\ProcessKeyvalOptions*
+
+% Forward caption to label in minted 3+ if caption key is not present
+\AtBeginDocument{%
+  \pgfkeysifdefined{/minted/cmd/caption}{}{%
+    \pgfkeys{/minted/cmd/caption/.code={\pgfkeys{/minted/cmd/label={##1}}}}%
+  }%
+}
+
+% --- Path Resolution Helpers ---
+\def\csnip@checkslash#1#2\@nil{%
+  \ifx#1/%
+    \csnip@isabstrue
+  \else
+    \csnip@isabsfalse
+  \fi
+}
+
+\def\csnip@resolvepath#1#2{%
+  \if\relax\detokenize{#1}\relax
+    \def\csnip@resolvedpath{#2}%
+  \else
+    \expandafter\csnip@checkslash#2/\@nil
+    \ifcsnip@isabs
+      \def\csnip@resolvedpath{#2}%
+    \else
+      \def\csnip@resolvedpath{#1/#2}%
+    \fi
+  \fi
+}
+
+% --- Cross-Referencing Helpers ---
+\newcommand{\csnip@recordlabel}[5]{% #1=key, #2=semantic, #3=loc, #4=lines, #5=file
+  \protected@write\@auxout{}{%
+    \string\csnip@setlabelmeta{#1}{#2}{#3}{#4}{#5}%
+  }%
+}
+\newcommand{\csnip@setlabelmeta}[5]{%
+  \global\@namedef{csnip@lab@sem@#1}{#2}%
+  \global\@namedef{csnip@lab@loc@#1}{#3}%
+  \global\@namedef{csnip@lab@lines@#1}{#4}%
+  \global\@namedef{csnip@lab@file@#1}{#5}%
+}
+
+\newcommand{\snippetref}[1]{%
+  \@ifundefined{csnip@lab@sem@#1}{\textbf{??}}{%
+    \texttt{\expandafter\detokenize\expandafter\expandafter\expandafter{\csname csnip@lab@sem@#1\endcsname}}%
+  }%
+}
+\newcommand{\snippetloc}[1]{%
+  \@ifundefined{csnip@lab@loc@#1}{\textbf{??}}{%
+    \texttt{\expandafter\detokenize\expandafter\expandafter\expandafter{\csname csnip@lab@loc@#1\endcsname}}%
+  }%
+}
+\newcommand{\snippetlines}[1]{%
+  \@ifundefined{csnip@lab@lines@#1}{\textbf{??}}{%
+    \expandafter\detokenize\expandafter\expandafter\expandafter{\csname csnip@lab@lines@#1\endcsname}%
+  }%
+}
+\newcommand{\snippetfile}[1]{%
+  \@ifundefined{csnip@lab@file@#1}{\textbf{??}}{%
+    \texttt{\expandafter\detokenize\expandafter\expandafter\expandafter{\csname csnip@lab@file@#1\endcsname}}%
+  }%
+}
+
+% --- Option Accumulator Helpers for Minted Pass-Through ---
+\newcommand{\csnip@localmintedopts}{}
+\newcommand{\csnip@setupmintedopts}{}
+
+\newcommand{\csnip@addlocalopt}[2]{%
+  \ifx\csnip@localmintedopts\@empty
+    \if\relax\detokenize{#2}\relax
+      \gdef\csnip@localmintedopts{#1}%
+    \else
+      \gdef\csnip@localmintedopts{#1={#2}}%
+    \fi
+  \else
+    \if\relax\detokenize{#2}\relax
+      \g@addto@macro\csnip@localmintedopts{,#1}%
+    \else
+      \g@addto@macro\csnip@localmintedopts{,#1={#2}}%
+    \fi
+  \fi
+}
+
+\newcommand{\csnip@addsetupopt}[2]{%
+  \ifx\csnip@setupmintedopts\@empty
+    \if\relax\detokenize{#2}\relax
+      \gdef\csnip@setupmintedopts{#1}%
+    \else
+      \gdef\csnip@setupmintedopts{#1={#2}}%
+    \fi
+  \else
+    \if\relax\detokenize{#2}\relax
+      \g@addto@macro\csnip@setupmintedopts{,#1}%
+    \else
+      \g@addto@macro\csnip@setupmintedopts{,#1={#2}}%
+    \fi
+  \fi
+}
+
+% --- PGFKeys Definitions ---
+
+% Setup Keys: configured globally via \codesnippetsetup{...}
+\pgfkeys{
+  /codesnippet/setup/.is family,
+  /codesnippet/setup/root/.code          = {\def\csnip@root{#1}},
+  /codesnippet/setup/python/.code        = {\def\csnip@python{#1}},
+  /codesnippet/setup/script/.code        = {\def\csnip@script{#1}},
+  /codesnippet/setup/lang/.code          = {\def\csnip@default@lang{#1}},
+  /codesnippet/setup/theme/.code         = {\edef\csnip@setstyle{\noexpand\setminted{style=#1}}\csnip@setstyle},
+  /codesnippet/setup/style/.code         = {\edef\csnip@setstyle{\noexpand\setminted{style=#1}}\csnip@setstyle},
+  /codesnippet/setup/ref/.code           = {\def\csnip@refmode{#1}},
+  /codesnippet/setup/titlemode/.code     = {\def\csnip@refmode{#1}},
+  /codesnippet/setup/refformat/.code     = {\def\csnip@refformat{#1}},
+  /codesnippet/setup/showtitle/.code     = {\csname csnip@showtitle#1\endcsname},
+  /codesnippet/setup/titleprefix/.code   = {\def\csnip@titleprefix{#1}},
+  /codesnippet/setup/titlestyle/.code    = {\def\csnip@titlestyle{#1}},
+  /codesnippet/setup/titlesep/.code      = {\def\csnip@titlesep{#1}},
+  /codesnippet/setup/titlecolor/.code    = {\colorlet{csniptitle}{#1}},
+  /codesnippet/setup/locstyle/.code      = {\def\csnip@locstyle{#1}},
+  /codesnippet/setup/refstyle/.code      = {\def\csnip@locstyle{#1}},
+  /codesnippet/setup/locationstyle/.code = {\def\csnip@locstyle{#1}},
+  /codesnippet/setup/loccolor/.code      = {\colorlet{csniploc}{#1}},
+  /codesnippet/setup/refcolor/.code      = {\colorlet{csniploc}{#1}},
+  /codesnippet/setup/locationcolor/.code = {\colorlet{csniploc}{#1}},
+  /codesnippet/setup/lineprefix/.code    = {\def\csnip@lineprefix{#1}},
+  /codesnippet/setup/locprefix/.code     = {\def\csnip@locprefix{#1}},
+  /codesnippet/setup/rulecolor/.code     = {\colorlet{csniprule}{#1}},
+  /codesnippet/setup/numbercolor/.code   = {\colorlet{csnipnum}{#1}},
+  /codesnippet/setup/.unknown/.code      = {%
+    \ifx\pgfkeyscurrentvalue\pgfkeysnovalue@text
+      \expandafter\csnip@addsetupopt\expandafter{\pgfkeyscurrentname}{}%
+    \else
+      \expandafter\csnip@addsetupopt\expandafter{\pgfkeyscurrentname}{#1}%
+    \fi
+  }
+}
+
+% Local Keys: per-snippet overrides via \codesnippet[...]{file}{symbol}
+\pgfkeys{
+  /codesnippet/local/.is family,
+  /codesnippet/local/root/.code          = {\def\csnip@root{#1}},
+  /codesnippet/local/python/.code        = {\def\csnip@python{#1}},
+  /codesnippet/local/script/.code        = {\def\csnip@script{#1}},
+  /codesnippet/local/lang/.code          = {\def\csnip@lang{#1}},
+  /codesnippet/local/label/.code         = {\def\csnip@labelkey{#1}},
+  /codesnippet/local/ref/.code           = {\def\csnip@refmode{#1}},
+  /codesnippet/local/titlemode/.code     = {\def\csnip@refmode{#1}},
+  /codesnippet/local/refformat/.code     = {\def\csnip@refformat{#1}},
+  /codesnippet/local/title/.code         = {%
+    \def\csnip@temptit{#1}%
+    \def\csnip@none{none}%
+    \ifx\csnip@temptit\csnip@none
+      \csnip@showtitlefalse
+    \else
+      \csnip@showtitletrue
+      \def\csnip@currtitle{#1}%
+    \fi
+  },
+  /codesnippet/local/showtitle/.code     = {\csname csnip@showtitle#1\endcsname},
+  /codesnippet/local/titleprefix/.code   = {\def\csnip@titleprefix{#1}},
+  /codesnippet/local/titlestyle/.code    = {\def\csnip@titlestyle{#1}},
+  /codesnippet/local/titlesep/.code      = {\def\csnip@titlesep{#1}},
+  /codesnippet/local/titlecolor/.code    = {\colorlet{csniptitle}{#1}},
+  /codesnippet/local/locstyle/.code      = {\def\csnip@locstyle{#1}},
+  /codesnippet/local/refstyle/.code      = {\def\csnip@locstyle{#1}},
+  /codesnippet/local/locationstyle/.code = {\def\csnip@locstyle{#1}},
+  /codesnippet/local/loccolor/.code      = {\colorlet{csniploc}{#1}},
+  /codesnippet/local/refcolor/.code      = {\colorlet{csniploc}{#1}},
+  /codesnippet/local/locationcolor/.code = {\colorlet{csniploc}{#1}},
+  /codesnippet/local/lineprefix/.code    = {\def\csnip@lineprefix{#1}},
+  /codesnippet/local/locprefix/.code     = {\def\csnip@locprefix{#1}},
+  /codesnippet/local/rulecolor/.code     = {\colorlet{csniprule}{#1}},
+  /codesnippet/local/numbercolor/.code   = {\colorlet{csnipnum}{#1}},
+  /codesnippet/local/.unknown/.code      = {%
+    \ifx\pgfkeyscurrentvalue\pgfkeysnovalue@text
+      \expandafter\csnip@addlocalopt\expandafter{\pgfkeyscurrentname}{}%
+    \else
+      \expandafter\csnip@addlocalopt\expandafter{\pgfkeyscurrentname}{#1}%
+    \fi
+  }
+}
+
+% Safe detector for presence of '=' without fragile expansion
+\def\csnip@checkeq#1{\expandafter\csnip@checkeq@aux\detokenize{#1}=\@nil}
+\def\csnip@checkeq@aux#1=#2\@nil{%
+  \if\relax\detokenize{#2}\relax
+    \csnip@haseqfalse
+  \else
+    \csnip@haseqtrue
+  \fi
+}
+
+% --- Global Document Setup Macro ---
+\newcommand{\codesnippetsetup}[1]{%
+  \gdef\csnip@setupmintedopts{}%
+  \pgfqkeys{/codesnippet/setup}{#1}%
+  \ifx\csnip@setupmintedopts\@empty\else
+    \expandafter\setminted\expandafter{\csnip@setupmintedopts}%
+  \fi
+}
+
+% --- Project Root Environment ---
+% Scopes path resolution and settings to the enclosed block
+\newenvironment{codesnippetproject}[2][]{%
+  \begingroup
+  \codesnippetsetup{root={#2}, #1}%
+}{%
+  \endgroup
+}
+% Friendly alias
+\let\snippetproject\codesnippetproject
+\let\endsnippetproject\endcodesnippetproject
+
+% Default minted settings: lightweight bounds and comfortable spacing
+\setminted{
+  fontsize = \small,
+  frame = lines,
+  framerule = 0.5pt,
+  rulecolor = \color{csniprule},
+  framesep = 2.5mm,
+  linenos = true,
+  numbersep = 8pt,
+  xleftmargin = 1.8em,
+  breaklines = true,
+  tabsize = 4
+}
+
+% Apply load-time defaults
+\codesnippetsetup{
+  root       = \csnipopt@root,
+  python     = \csnipopt@python,
+  script     = \csnipopt@script,
+  theme      = \csnipopt@theme,
+  lang       = \csnipopt@lang,
+  ref        = \csnipopt@ref,
+  refformat  = \csnipopt@refformat,
+}
+
+% Global counter for unique temporary cache files per snippet
+\newcounter{csnip@count}
+
+% --- Core Snippet Macro ---
+% Syntax:
+%   \codesnippet{file}{symbol}
+%   \codesnippet[language]{file}{symbol}
+%   \codesnippet[key=value,...]{file}{symbol}
+\newcommand{\codesnippet}[3][]{%
+  \begingroup
+  \gdef\csnip@localmintedopts{}%
+  \edef\csnip@lang{\csnip@default@lang}%
+  \def\csnip@currtitle{\detokenize{#3}}%
+  \def\csnip@relpath{\detokenize{#2}}%
+  \def\csnip@labelkey{}%
+  % Parse optional argument
+  \if\relax\detokenize{#1}\relax
+    % No options provided: inherit current document/environment defaults
+  \else
+    \csnip@checkeq{#1}%
+    \ifcsnip@haseq
+      % Key-value list
+      \pgfqkeys{/codesnippet/local}{#1}%
+    \else
+      % Shorthand language token (e.g. [cpp], [python])
+      \edef\csnip@lang{#1}%
+    \fi
+  \fi
+  % Resolve path relative to project root or compilation pwd
+  \csnip@resolvepath{\csnip@root}{#2}%
+  % Step snippet counter and allocate isolated temp & meta files
+  \stepcounter{csnip@count}%
+  \edef\csnip@currtempfile{.codesnippet_\jobname_\arabic{csnip@count}.tmp}%
+  \edef\csnip@currmetafile{.codesnippet_\jobname_\arabic{csnip@count}.meta}%
+  % Run extractor script via shell escape
+  \ShellEscape{CS_SCRIPT="$([ -f "\csnip@script" ] && echo "\csnip@script" || kpsewhich "\csnip@script" 2>/dev/null || echo "\csnip@script")"; \csnip@python\space "$CS_SCRIPT" "\csnip@resolvedpath" "#3" --meta-out "\csnip@currmetafile" > "\csnip@currtempfile"}%
+  % Load metadata
+  \gdef\csnip@meta@startline{0}%
+  \gdef\csnip@meta@endline{0}%
+  \gdef\csnip@meta@lines{?}%
+  \InputIfFileExists{\csnip@currmetafile}{}{}%
+  % Construct location string (relative path + line range)
+  \def\csnip@curlocation{\csnip@relpath\csnip@lineprefix\csnip@meta@lines}%
+  % Record cross-reference label if requested
+  \ifx\csnip@labelkey\@empty\else
+    \csnip@recordlabel{\csnip@labelkey}{\csnip@currtitle}{\csnip@curlocation}{\csnip@meta@lines}{\csnip@relpath}%
+    \def\@currentlabel{\csnip@currtitle}%
+    \label{\csnip@labelkey}%
+  \fi
+  % Render Title / Reference Header (if not suppressed)
+  \ifcsnip@showtitle
+    \par\addvspace{0.7em}%
+    \def\csnip@semmode{semantic}%
+    \def\csnip@locmode{location}%
+    \def\csnip@realmode{real}%
+    \def\csnip@bothmode{both}%
+    \ifx\csnip@refmode\csnip@locmode
+      \noindent{\csnip@locstyle\color{csniploc}\csnip@titleprefix\csnip@curlocation}%
+    \else\ifx\csnip@refmode\csnip@realmode
+      \noindent{\csnip@locstyle\color{csniploc}\csnip@titleprefix\csnip@curlocation}%
+    \else\ifx\csnip@refmode\csnip@bothmode
+      \def\csnip@fmtinline{inline}%
+      \def\csnip@fmtbracket{bracket}%
+      \def\csnip@fmtstacked{stacked}%
+      \ifx\csnip@refformat\csnip@fmtbracket
+        \noindent{\csnip@titlestyle\color{csniptitle}\csnip@titleprefix\csnip@currtitle}\space\space
+        {\csnip@locstyle\color{csniploc}[\csnip@curlocation]}%
+      \else\ifx\csnip@refformat\csnip@fmtstacked
+        \noindent{\csnip@titlestyle\color{csniptitle}\csnip@titleprefix\csnip@currtitle}\par\nopagebreak\vspace{0.1em}\nopagebreak
+        \noindent{\csnip@locstyle\color{csniploc}\csnip@locprefix\csnip@curlocation}%
+      \else
+        % default: inline flush right
+        \noindent{\csnip@titlestyle\color{csniptitle}\csnip@titleprefix\csnip@currtitle}%
+        \hfill
+        {\csnip@locstyle\color{csniploc}\csnip@curlocation}%
+      \fi\fi
+    \else
+      % default: semantic
+      \noindent{\csnip@titlestyle\color{csniptitle}\csnip@titleprefix\csnip@currtitle}%
+    \fi\fi\fi
+    \par\nopagebreak
+    \vspace{\csnip@titlesep}\nopagebreak
+  \else
+    \par\addvspace{0.5em}%
+  \fi
+  % Render Minted Code Block
+  \ifx\csnip@localmintedopts\@empty
+    \inputminted{\csnip@lang}{\csnip@currtempfile}%
+  \else
+    \expandafter\inputminted\expandafter[\csnip@localmintedopts]{\csnip@lang}{\csnip@currtempfile}%
+  \fi
+  \endgroup
+}
+
+\endinput
